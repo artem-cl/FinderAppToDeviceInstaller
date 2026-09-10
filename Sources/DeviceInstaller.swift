@@ -10,6 +10,7 @@ struct Target {
     let label: String
     let kind: String
     let booted: Bool
+    var avd: String? = nil
 }
 let fm = FileManager.default
 let home = fm.homeDirectoryForCurrentUser.path
@@ -135,8 +136,183 @@ func androidTargets(_ text: String) -> [Target] {
     }
 }
 
+// AVD identity is stable; ADB serials are assigned anew when an emulator starts.
+struct AndroidInstance {
+    let serial: String
+    let name: String?
+}
+
+func emulatorPath() -> String? {
+    let env = ProcessInfo.processInfo.environment
+    var roots = [env["ANDROID_HOME"], env["ANDROID_SDK_ROOT"], home + "/Library/Android/sdk"]
+        .compactMap { $0 }
+    if let adb = try? adbPath() {
+        roots.append(
+            URL(fileURLWithPath: adb).deletingLastPathComponent().deletingLastPathComponent().path)
+    }
+    return roots.map { $0 + "/emulator/emulator" }.first { fm.isExecutableFile(atPath: $0) }
+}
+
+func avdNames(_ output: String) -> [String] {
+    Array(
+        Set(
+            output.split(whereSeparator: \.isNewline).map(String.init)
+                .filter { !$0.isEmpty && !$0.contains(where: \.isWhitespace) })
+    ).sorted()
+}
+
+func androidInstances(_ output: String, name: (String) -> String?) -> [AndroidInstance] {
+    output.split(whereSeparator: \.isNewline).compactMap { line in
+        let fields = line.split(whereSeparator: \.isWhitespace)
+        guard fields.count >= 2, fields[0].hasPrefix("emulator-") else { return nil }
+        let serial = String(fields[0])
+        return AndroidInstance(serial: serial, name: name(serial))
+    }
+}
+
+func instanceName(_ output: String) -> String? {
+    let lines = output.split(whereSeparator: \.isNewline).map(String.init)
+    guard lines.count == 2, lines[1] == "OK", !lines[0].isEmpty else { return nil }
+    return lines[0]
+}
+
+func mergedAndroidTargets(_ output: String, avds: [String], instances: [AndroidInstance])
+    -> [Target]
+{
+    var result = androidTargets(output).filter { !$0.id.hasPrefix("emulator-") }
+    for instance in instances {
+        result.append(
+            Target(
+                id: instance.serial,
+                label:
+                    "\(instance.name ?? instance.serial) · Android emulator · Running / starting",
+                kind: "android", booted: true, avd: instance.name))
+    }
+    for name in avds where !instances.contains(where: { $0.name == name }) {
+        result.append(
+            Target(
+                id: name,
+                label:
+                    "\(name) · Android emulator · \(instances.contains(where: { $0.name == nil }) ? "Status unknown" : "Start & install")",
+                kind: "android", booted: false, avd: name))
+    }
+    return result
+}
+
+func discoverAndroid() throws -> [Target] {
+    let adb = try adbPath()
+    let output = try run(adb, ["devices", "-l"])
+    let instances = androidInstances(output) { serial in
+        (try? run(adb, ["-s", serial, "emu", "avd", "name"], timeout: 2)).flatMap(instanceName)
+    }
+    // An absent/broken emulator installation must not hide connected phones.
+    let names =
+        emulatorPath().flatMap { try? run($0, ["-list-avds"], timeout: 5) }.map(avdNames) ?? []
+    return mergedAndroidTargets(output, avds: names, instances: instances)
+}
+
+struct EmulatorStartFailure: LocalizedError {
+    let error: Error
+    var errorDescription: String? { error.localizedDescription }
+}
+
+final class EmulatorLaunch {
+    let process = Process()
+    let log = fm.temporaryDirectory.appendingPathComponent("emulator-" + UUID().uuidString + ".log")
+    init(executable: String, name: String) throws {
+        fm.createFile(atPath: log.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: log)
+        defer { try? handle.close() }
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["-avd", name]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = handle
+        process.standardError = handle
+        try process.run()
+    }
+    func check() throws {
+        if !process.isRunning {
+            let detail = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            throw Failure(
+                message: "The emulator exited before it was ready.\n" + String(detail.suffix(3000)))
+        }
+    }
+    deinit { try? fm.removeItem(at: log) }
+}
+
+// All commands, the clock, and startup are injected for deterministic boot/race tests.
+func prepareAndroid(
+    _ target: Target, cancellation: Cancellation, timeout: Double = 180,
+    now: () -> Double = { ProcessInfo.processInfo.systemUptime },
+    sleep: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) },
+    command: ([String], Double) throws -> String,
+    launch: (String) throws -> Void, checkLaunch: () throws -> Void
+) throws -> String {
+    let deadline = now() + timeout
+    var launched = false
+    var lastError = "Android is still starting."
+    while now() < deadline {
+        try cancellation.check()
+        try checkLaunch()
+        do {
+            func execute(_ args: [String]) throws -> String {
+                try cancellation.check()
+                guard now() < deadline else { throw Failure(message: "Boot deadline reached.") }
+                return try command(args, min(3, deadline - now()))
+            }
+            var serial = target.id
+            if let avd = target.avd {
+                let output = try execute(["devices", "-l"])
+                let instances = androidInstances(output) { id in
+                    (try? execute(["-s", id, "emu", "avd", "name"])).flatMap(instanceName)
+                }
+                if let match = instances.first(where: { $0.name == avd && $0.serial == target.id })
+                    ?? instances.first(where: { $0.name == avd })
+                {
+                    serial = match.serial
+                } else {
+                    // An offline, unidentified instance may already be this AVD. Wait rather than duplicate it.
+                    if !launched && !instances.contains(where: { $0.name == nil }) {
+                        try cancellation.check()
+                        guard now() < deadline else {
+                            throw Failure(message: "Boot deadline reached.")
+                        }
+                        do { try launch(avd) } catch { throw EmulatorStartFailure(error: error) }
+                        launched = true
+                    }
+                    throw Failure(
+                        message:
+                            "Waiting for \(avd) to appear in ADB. Another emulator may still be starting."
+                    )
+                }
+            }
+            let state = try execute(["-s", serial, "get-state"]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            let boot = try execute(["-s", serial, "shell", "getprop", "sys.boot_completed"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let packages = try execute(["-s", serial, "shell", "pm", "path", "android"])
+            try cancellation.check()
+            if state == "device", boot == "1", packages.contains("package:"), now() < deadline {
+                return serial
+            }
+        } catch is OperationCancelled { throw OperationCancelled() } catch let error
+            as EmulatorStartFailure
+        { throw error } catch { lastError = error.localizedDescription }
+        let pauseEnd = min(deadline, now() + 1)
+        while now() < pauseEnd {
+            try cancellation.check()
+            sleep(min(0.1, pauseEnd - now()))
+        }
+    }
+    try cancellation.check()
+    throw Failure(
+        message:
+            "Android did not become ready within \(Int(timeout)) seconds. Retry or refresh the device list.\n"
+            + lastError)
+}
+
 func targets(_ kind: String) throws -> [Target] {
-    if kind == "android" { return androidTargets(try run(adbPath(), ["devices", "-l"])) }
+    if kind == "android" { return try discoverAndroid() }
     if kind == "simulator" {
         let data = try json(["simctl", "list", "devices", "available", "--json"])
         let groups = data["devices"] as? [String: [[String: Any]]] ?? [:]
@@ -360,8 +536,8 @@ class Controller: NSObject, NSApplicationDelegate {
         alert.messageText = devices.isEmpty ? "No devices available" : "Install \(filename)"
         alert.informativeText =
             devices.isEmpty
-            ? "Connect and unlock your phone, or start an Android emulator. For Android, enable USB debugging and accept the connection prompt. For iOS, pair the device in Xcode once, enable Developer Mode, and use the same Wi-Fi network or USB."
-            : "Choose a destination. Paired iPhones may be offline; we will try to connect for up to 45 seconds. Unlock your phone. Stopped iOS simulators will start automatically."
+            ? "Connect and unlock your phone, or create an Android virtual device in Android Studio’s Device Manager. For Android, enable USB debugging and accept the connection prompt. For iOS, pair the device in Xcode once, enable Developer Mode, and use the same Wi-Fi network or USB."
+            : "Choose a destination. Paired iPhones may be offline; we will try to connect for up to 45 seconds. Unlock your phone. Stopped iOS simulators and Android emulators will start automatically. Android startup may take up to 3 minutes."
         let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 550, height: 28))
         if !devices.isEmpty {
             picker.addItems(withTitles: devices.map(\.label))
@@ -451,14 +627,14 @@ class Controller: NSObject, NSApplicationDelegate {
         alert.informativeText =
             String(error.localizedDescription.suffix(4000))
             + (installationStarted
-                ? "\n\nCheck the app on your phone before installing again. The installation was not automatically retried."
+                ? "\n\nCheck the app on your device before installing again. The installation was not automatically retried."
                 : "")
         if target != nil { alert.addButton(withTitle: "Retry") }
         alert.addButton(withTitle: "Refresh")
         alert.addButton(withTitle: "Cancel")
         let response = alert.runModal()
         if let target, response == .alertFirstButtonReturn {
-            installIOS(target)
+            install(target)
         } else if response.rawValue == (target == nil ? 1000 : 1001) {
             discover()
         } else {
@@ -466,17 +642,72 @@ class Controller: NSObject, NSApplicationDelegate {
         }
     }
 
+    func installAndroid(_ target: Target) {
+        let cancellation = Cancellation()
+        connectionCancellation = cancellation
+        cancelButton.isHidden = false
+        cancelButton.isEnabled = true
+        status.stringValue =
+            "Starting / connecting to Android… Cancel stops installation; the emulator stays open."
+        DispatchQueue.global(qos: .userInitiated).async {
+            var installationStarted = false
+            var emulator: EmulatorLaunch?
+            do {
+                let adb = try adbPath()
+                let serial = try prepareAndroid(
+                    target, cancellation: cancellation,
+                    command: { try run(adb, $0, timeout: $1, cancellation: cancellation) },
+                    launch: { name in
+                        guard let executable = emulatorPath() else {
+                            throw Failure(
+                                message:
+                                    "Install Android Emulator using Android Studio’s SDK Manager.")
+                        }
+                        emulator = try EmulatorLaunch(executable: executable, name: name)
+                    }, checkLaunch: { try emulator?.check() })
+                DispatchQueue.main.sync {
+                    if !cancellation.isCancelled {
+                        installationStarted = true
+                        self.connectionCancellation = nil
+                        self.cancelButton.isHidden = true
+                        self.status.stringValue = "Installing \(self.filename) on \(target.label)…"
+                    }
+                }
+                try cancellation.check()
+                _ = try run(adb, ["-s", serial, "install", "-r", self.appPath], timeout: 300)
+                DispatchQueue.main.async {
+                    self.finish(
+                        "App installed", "\(self.filename) was installed on \(target.label).")
+                }
+            } catch {
+                let failedDuringInstall = installationStarted
+                DispatchQueue.main.async {
+                    self.connectionCancellation = nil
+                    self.cancelButton.isHidden = true
+                    if error is OperationCancelled {
+                        self.discover()
+                    } else {
+                        self.recover(
+                            error, target: failedDuringInstall ? nil : target,
+                            installationStarted: failedDuringInstall)
+                    }
+                }
+            }
+        }
+    }
+
     func install(_ target: Target) {
+        if target.kind == "android" {
+            installAndroid(target)
+            return
+        }
         if target.kind == "ios" {
             installIOS(target)
             return
         }
         status.stringValue = "Installing \(filename) on \(target.label)…"
         background {
-            if target.kind == "android" {
-                _ = try run(
-                    adbPath(), ["-s", target.id, "install", "-r", self.appPath], timeout: 300)
-            } else if target.kind == "simulator" {
+            if target.kind == "simulator" {
                 if !target.booted {
                     _ = try run("/usr/bin/xcrun", ["simctl", "boot", target.id])
                     _ = try run(
@@ -669,8 +900,85 @@ func tryReady(_ data: [String: Any]) -> Bool {
     (try? iosReady(data, id: "test-iphone")) == true
 }
 
+func testAndroidStartup() throws {
+    let output = "List of devices attached\nphone device model:Pixel\nemulator-5554 offline\n"
+    let instances = androidInstances(output) { _ in "Pixel_8" }
+    let merged = mergedAndroidTargets(output, avds: ["Pixel_8", "Tablet"], instances: instances)
+    precondition(merged.count == 3 && merged[2].avd == "Tablet" && !merged[2].booted)
+    precondition(avdNames("Pixel_8\nTablet\nPixel_8\n") == ["Pixel_8", "Tablet"])
+    precondition(instanceName("Pixel_8\nOK\n") == "Pixel_8")
+    precondition(instanceName("error: offline") == nil)
+    let target = Target(
+        id: "Pixel_8", label: "Pixel", kind: "android", booted: false, avd: "Pixel_8")
+    for scenario in [
+        "stopped", "running", "unknown", "timeout", "cancel", "launch-error", "exit", "deadline",
+        "cancel-wait",
+    ] {
+        var time = 0.0
+        var launches = 0
+        var probes = 0
+        let token = Cancellation()
+        do {
+            let serial = try prepareAndroid(
+                target, cancellation: token, timeout: 4,
+                now: { time },
+                sleep: {
+                    time += $0
+                    if scenario == "cancel-wait" { token.cancel() }
+                },
+                command: { args, _ in
+                    if args == ["devices", "-l"] {
+                        probes += 1
+                        if scenario == "cancel" { token.cancel() }
+                        if scenario == "stopped" && launches == 0 || scenario == "launch-error"
+                            || scenario == "exit" && launches == 0
+                        {
+                            return ""
+                        }
+                        return "emulator-5556 device\nemulator-5554 device\n"
+                    }
+                    if args.suffix(3) == ["emu", "avd", "name"] {
+                        if scenario == "unknown" { throw Failure(message: "offline") }
+                        return args[1] == "emulator-5556" ? "Other\nOK\n" : "Pixel_8\nOK\n"
+                    }
+                    precondition(
+                        args[1] == "emulator-5554", "Must target selected AVD, not first emulator")
+                    if args.last == "get-state" { return "device\n" }
+                    if args.last == "sys.boot_completed" {
+                        return scenario == "timeout" || probes < 2 ? "0" : "1"
+                    }
+                    if scenario == "deadline" { time = 4 }
+                    return "package:/system/framework/framework-res.apk\n"
+                },
+                launch: { _ in
+                    launches += 1
+                    if scenario == "launch-error" { throw Failure(message: "Missing image") }
+                },
+                checkLaunch: {
+                    if scenario == "exit" && launches > 0 { throw Failure(message: "Exited") }
+                })
+            precondition(["stopped", "running"].contains(scenario))
+            precondition(serial == "emulator-5554")
+            precondition(launches == (scenario == "stopped" ? 1 : 0))
+        } catch {
+            precondition(!["stopped", "running"].contains(scenario))
+            if scenario == "cancel" || scenario == "cancel-wait" {
+                precondition(error is OperationCancelled)
+            }
+            if scenario == "launch-error" || scenario == "exit" {
+                precondition(launches == 1 && time < 4)
+            }
+            if scenario == "unknown" { precondition(launches == 0) }
+        }
+    }
+    print(
+        "PASS: Android AVD merging, exact targeting, delayed boot, unknown identity, startup failure, deadline, cancellation"
+    )
+}
+
 if CommandLine.arguments.contains("--self-test") {
     try testIOSConnection()
+    try testAndroidStartup()
     let parsed = androidTargets(
         "List of devices attached\nphone123 device product:foo model:Pixel_9 transport_id:1\nbad unauthorized\nemulator-5554 device model:sdk_gphone64_arm64\noffline offline\n"
     )
