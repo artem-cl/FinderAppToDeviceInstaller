@@ -1,0 +1,22 @@
+{
+  "result": {
+    "devices": [
+      {
+        "identifier": "test-iphone",
+        "hardwareProperties": {
+          "platform": "iOS"
+        },
+        "deviceProperties": {
+          "name": "Test iPhone",
+          "osVersionNumber": "26.0",
+          "ddiServicesAvailable": false
+        },
+        "connectionProperties": {
+          "pairingState": "paired",
+          "tunnelState": "disconnected",
+          "transportType": "localNetwork"
+        }
+      }
+    ]
+  }
+}

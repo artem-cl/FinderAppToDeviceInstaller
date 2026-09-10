@@ -9,12 +9,20 @@ Select one `.ipa`, `.apk`, or iOS `.app`, then right-click → **Services → In
 | Input | Destinations |
 | --- | --- |
 | `.apk` | Authorized Android phones and running Android emulators |
-| `.ipa` or device-built `.app` | Paired, connected iPhones and iPads |
+| `.ipa` or device-built `.app` | Paired iPhones and iPads over Wi-Fi or USB |
 | Simulator-built `.app` | Available iOS simulators; stopped simulators start when selected |
 
-Existing signing and provisioning are preserved. A device IPA cannot run in an iOS simulator. The picker filters platform and connection state; the device installer performs final OS, CPU, and signature checks and displays errors. Apps are installed without automatically launching them.
+Existing signing and provisioning are preserved. A device IPA cannot run in an iOS simulator. The picker filters platform and pairing state; the device installer performs final OS, CPU, and signature checks and displays errors. Apps are installed without automatically launching them.
 
 APK updates use `adb install -r`, retaining app data when supported. Select one file per invocation; split APK sets are not supported. The action may appear for unrelated file types, but validates the selection before proceeding.
+
+## Wireless iPhone connections
+
+Paired iPhones stay visible even when their development connection is inactive. **Not connected** means the phone may be offline or may simply need a connection; it is not proof that installation is impossible.
+
+Choose the phone and click **Install**. The helper requests device details to establish the connection and waits up to 45 seconds for an active connection and available developer services. Unlock the iPhone, keep it nearby, and use the same Wi-Fi network or USB. Xcode is needed for initial pairing and development setup, but the helper can attempt reconnection without opening Xcode.
+
+**Cancel** stops the connection attempt and returns to device selection. A connection failure offers **Retry**, **Refresh**, or **Cancel**. Installation starts only after the readiness check and is never automatically retried: if installation fails or times out, check the phone before trying again.
 
 ## Requirements
 
@@ -51,9 +59,11 @@ The build targets the current Mac’s architecture and SDK defaults and uses an 
 ./tests/test.sh
 ```
 
-Tests rebuild the package, check Android discovery parsing and literal command arguments, verify signatures and property lists, and exercise installation/removal in a temporary directory. They do not install an app on a phone or modify your real Services folder. End-to-end device installation still requires manual testing with a suitable build and connected device.
+Tests rebuild the package, check Android and iOS discovery parsing and literal command arguments, verify signatures and property lists, and exercise installation/removal in a temporary directory. iOS tests use sanitized JSON fixtures and an injected clock to cover delayed readiness, cached responses, malformed data, disappearing devices, deadlines, cancellation, explicit retry, and installation errors without real waits or device access. A process cancellation test uses a local sleep process. They do not install an app on a phone or modify your real Services folder. End-to-end device installation still requires manual testing with a suitable build and connected device.
 
 GitHub Actions runs these tests on macOS when a pull request is opened, including draft pull requests. Subsequent pushes do not trigger tests. To run them later, use **Actions → Tests → Run workflow** and select the desired branch. The manual run option becomes available once the workflow is on the default branch.
+
+For real-device validation, close Xcode and try Wi-Fi installation with the phone unlocked, then locked and unlocked during the connection wait. Also check an unreachable phone, cancellation, Retry, and USB. These checks require a paired device and a compatible app; GitHub-hosted CI covers simulated responses, not actual wireless connectivity.
 
 ## Uninstall
 
