@@ -1,0 +1,13 @@
+.DS_Store
+build/
+dist/
+.swift-cache/
+__pycache__/
+*.pyc
+# Local app samples and signing material
+*.ipa
+*.apk
+*.mobileprovision
+*.p12
+*.p8
+*.log
