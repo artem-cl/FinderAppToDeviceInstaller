@@ -2,7 +2,7 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 "$PROJECT_DIR/scripts/build.sh"
-"$PROJECT_DIR/build/Install on Device.workflow/Contents/Resources/Install on Device.app/Contents/MacOS/DeviceInstaller" --self-test
+"$PROJECT_DIR/build/Install on Device.workflow/Contents/Resources/Install on Device.app/Contents/MacOS/DeviceInstaller" --self-test --fixtures "$PROJECT_DIR/tests/fixtures"
 TEST_DIR=$(mktemp -d)
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 export INSTALL_SERVICES_DIR="$TEST_DIR/Services with spaces"
